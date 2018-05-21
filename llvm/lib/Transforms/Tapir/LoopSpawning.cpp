@@ -36,7 +36,6 @@
 #include "llvm/IR/Type.h"
 #include "llvm/IR/ValueMap.h"
 #include "llvm/IR/Verifier.h"
-#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
@@ -46,10 +45,8 @@
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Scalar/LoopDeletion.h"
 #include "llvm/Transforms/Tapir.h"
-#include "llvm/Transforms/Tapir/CilkABI.h"
-#include "llvm/Transforms/Tapir/OpenMPABI.h"
-#include "llvm/Transforms/Tapir/TapirUtils.h"
 #include "llvm/Transforms/Tapir/Outline.h"
+#include "llvm/Transforms/Tapir/TapirUtils.h"
 #include "llvm/Transforms/Utils/PromoteMemToReg.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 #include "llvm/Transforms/Utils/TapirUtils.h"
@@ -71,24 +68,26 @@
 using std::make_pair;
 
 using namespace llvm;
-using namespace llvm::tapir;
 
-#define LS_NAME "loop-spawning"
 #define DEBUG_TYPE LS_NAME
 
 STATISTIC(LoopsAnalyzed, "Number of Tapir loops analyzed");
 STATISTIC(LoopsConvertedToDAC,
           "Number of Tapir loops converted to divide-and-conquer iteration spawning");
-STATISTIC(LoopsConvertedToCilkABI,
-          "Number of Tapir loops converted to use the Cilk ABI for loops");
 
-cl::opt<bool> cilkTarget("cilk-target", cl::init(false), cl::Hidden,
-                       cl::desc("For allowing loop spawning to be cilk abi if none given"));
+static cl::opt<TapirTargetType> ClTapirTarget(
+    "ls-tapir-target", cl::desc("Target runtime for Tapir"),
+    cl::init(TapirTargetType::Cilk),
+    cl::values(clEnumValN(TapirTargetType::None,
+                          "none", "None"),
+               clEnumValN(TapirTargetType::Serial,
+                          "serial", "Serial code"),
+               clEnumValN(TapirTargetType::Cilk,
+                          "cilk", "Cilk Plus"),
+               clEnumValN(TapirTargetType::OpenMP,
+                          "openmp", "OpenMP")));
 
 namespace {
-// Forward declarations.
-class LoopSpawningHints;
-
 // /// \brief This modifies LoopAccessReport to initialize message with
 // /// tapir-loop-specific part.
 // class LoopSpawningReport : public LoopAccessReport {
@@ -357,68 +356,6 @@ static void emitMissedWarning(Function *F, Loop *L,
   }
 }
 
-/// LoopOutline serves as a base class for different variants of LoopSpawning.
-/// LoopOutline implements common parts of LoopSpawning transformations, namely,
-/// lifting a Tapir loop into a separate helper function.
-class LoopOutline {
-public:
-  LoopOutline(Loop *OrigLoop, ScalarEvolution &SE,
-              LoopInfo *LI, DominatorTree *DT,
-              AssumptionCache *AC,
-              OptimizationRemarkEmitter &ORE)
-      : OrigLoop(OrigLoop), SE(SE), LI(LI), DT(DT), AC(AC), ORE(ORE),
-        ExitBlock(nullptr)
-  {
-    // Use the loop latch to determine the canonical exit block for this loop.
-    TerminatorInst *TI = OrigLoop->getLoopLatch()->getTerminator();
-    if (2 != TI->getNumSuccessors())
-      return;
-    ExitBlock = TI->getSuccessor(0);
-    if (ExitBlock == OrigLoop->getHeader())
-      ExitBlock = TI->getSuccessor(1);
-  }
-
-  virtual bool processLoop() = 0;
-
-  virtual ~LoopOutline() {}
-
-protected:
-  PHINode* canonicalizeIVs(Type *Ty);
-  Value* canonicalizeLoopLatch(PHINode *IV, Value *Limit);
-  void unlinkLoop();
-
-  /// The original loop.
-  Loop *OrigLoop;
-
-  /// A wrapper around ScalarEvolution used to add runtime SCEV checks. Applies
-  /// dynamic knowledge to simplify SCEV expressions and converts them to a
-  /// more usable form.
-  // PredicatedScalarEvolution &PSE;
-  ScalarEvolution &SE;
-  /// Loop info.
-  LoopInfo *LI;
-  /// Dominator tree.
-  DominatorTree *DT;
-  /// Assumption cache.
-  AssumptionCache *AC;
-  /// Interface to emit optimization remarks.
-  OptimizationRemarkEmitter &ORE;
-
-  /// The exit block of this loop.  We compute our own exit block, based on the
-  /// latch, and handle other exit blocks (i.e., for exception handling) in a
-  /// special manner.
-  BasicBlock *ExitBlock;
-
-// private:
-//   /// Report an analysis message to assist the user in diagnosing loops that are
-//   /// not transformed.  These are handled as LoopAccessReport rather than
-//   /// VectorizationReport because the << operator of LoopSpawningReport returns
-//   /// LoopAccessReport.
-//   void emitAnalysis(const LoopAccessReport &Message) const {
-//     emitAnalysisDiag(OrigLoop, *ORE, Message);
-//   }
-};
-
 /// DACLoopSpawning implements the transformation to spawn the iterations of a
 /// Tapir loop in a recursive divide-and-conquer fashion.
 class DACLoopSpawning : public LoopOutline {
@@ -470,34 +407,6 @@ protected:
 //   }
 };
 
-/// CilkABILoopSpawning uses the Cilk Plus ABI to handle Tapir loops.
-class CilkABILoopSpawning : public LoopOutline {
-public:
-  CilkABILoopSpawning(Loop *OrigLoop, ScalarEvolution &SE,
-                      LoopInfo *LI, DominatorTree *DT,
-                      AssumptionCache *AC,
-                      OptimizationRemarkEmitter &ORE)
-      : LoopOutline(OrigLoop, SE, LI, DT, AC, ORE)
-  {}
-
-  bool processLoop();
-
-  virtual ~CilkABILoopSpawning() {}
-
-protected:
-  // PHINode* canonicalizeIVs(Type *Ty);
-  Value* canonicalizeLoopLatch(PHINode *IV, Value *Limit);
-
-// private:
-//   /// Report an analysis message to assist the user in diagnosing loops that are
-//   /// not transformed.  These are handled as LoopAccessReport rather than
-//   /// VectorizationReport because the << operator of LoopSpawningReport returns
-//   /// LoopAccessReport.
-//   void emitAnalysis(const LoopAccessReport &Message) const {
-//     emitAnalysisDiag(OrigLoop, *ORE, Message);
-//   }
-};
-
 struct LoopSpawningImpl {
   // LoopSpawningImpl(Function &F, LoopInfo &LI, ScalarEvolution &SE,
   //                  DominatorTree &DT,
@@ -515,7 +424,6 @@ struct LoopSpawningImpl {
   //     : F(F), GetLI(GetLI), LI(nullptr), GetSE(GetSE), GetDT(GetDT),
   //       ORE(ORE)
   // {}
-  TapirTarget* tapirTarget;
   LoopSpawningImpl(Function &F,
                    LoopInfo &LI,
                    ScalarEvolution &SE,
@@ -529,7 +437,6 @@ struct LoopSpawningImpl {
 
 private:
   void addTapirLoop(Loop *L, SmallVectorImpl<Loop *> &V);
-  bool isTapirLoop(const Loop *L);
   bool processLoop(Loop *L);
 
   // +===== Kitsune
@@ -548,6 +455,8 @@ private:
   // AliasAnalysis *AA;
   AssumptionCache &AC;
   OptimizationRemarkEmitter &ORE;
+
+  TapirTarget* tapirTarget;
 };
 } // end anonymous namespace
 
@@ -558,8 +467,9 @@ PHINode* LoopOutline::canonicalizeIVs(Type *Ty) {
 
   BasicBlock* Header = L->getHeader();
   Module* M = Header->getParent()->getParent();
+  const DataLayout &DL = M->getDataLayout();
 
-  SCEVExpander Exp(SE, M->getDataLayout(), "ls");
+  SCEVExpander Exp(SE, DL, "ls");
 
   PHINode *CanonicalIV = Exp.getOrInsertCanonicalInductionVariable(L, Ty);
   DEBUG(dbgs() << "LS Canonical induction variable " << *CanonicalIV << "\n");
@@ -802,24 +712,22 @@ void DACLoopSpawning::implementDACIterSpawnOnHelper(Function *Helper,
     IRBuilder<> Builder(&(RecurDet->front()));
     SetVector<Value*> RecurInputs;
     Function::arg_iterator AI = Helper->arg_begin();
+    // Handle an initial sret argument, if necessary.  Based on how
+    // the Helper function is created, any sret parameter will be the
+    // first parameter.
+    if (Helper->hasParamAttribute(0, Attribute::StructRet))
+      RecurInputs.insert(&*AI++);
     assert(cast<Argument>(CanonicalIVInput) == &*AI &&
-           "First argument does not match original input to canonical IV.");
+           "First non-sret argument does not match original input to canonical IV.");
     RecurInputs.insert(CanonicalIVStart);
     ++AI;
     assert(Limit == &*AI &&
-           "Second argument does not match original input to the loop limit.");
+           "Second non-sret argument does not match original input to the loop limit.");
     RecurInputs.insert(MidIter);
     ++AI;
     for (Function::arg_iterator AE = Helper->arg_end();
          AI != AE;  ++AI)
         RecurInputs.insert(&*AI);
-    // RecurInputs.insert(CanonicalIVStart);
-    // // for (PHINode *IV : IVs)
-    // //   RecurInputs.insert(DACStart[IV]);
-    // RecurInputs.insert(Limit);
-    // RecurInputs.insert(Grainsize);
-    // for (Value *V : BodyInputs)
-    //   RecurInputs.insert(VMap[V]);
     DEBUG({
         dbgs() << "RecurInputs: ";
         for (Value *Input : RecurInputs)
@@ -899,6 +807,32 @@ static void getEHExits(Loop *L, const BasicBlock *DesignatedExitBlock,
       WorkList.push_back(Succ);
     }
   }
+}
+
+/// Convert a pointer to an integer type.
+///
+/// Copied from Transforms/Vectorizer/LoopVectorize.cpp.
+static Type *convertPointerToIntegerType(const DataLayout &DL, Type *Ty) {
+  if (Ty->isPointerTy())
+    return DL.getIntPtrType(Ty);
+
+  // It is possible that char's or short's overflow when we ask for the loop's
+  // trip count, work around this by changing the type size.
+  if (Ty->getScalarSizeInBits() < 32)
+    return Type::getInt32Ty(Ty->getContext());
+
+  return Ty;
+}
+
+/// Get the wider of two integer types.
+///
+/// Copied from Transforms/Vectorizer/LoopVectorize.cpp.
+static Type *getWiderType(const DataLayout &DL, Type *Ty0, Type *Ty1) {
+  Ty0 = convertPointerToIntegerType(DL, Ty0);
+  Ty1 = convertPointerToIntegerType(DL, Ty1);
+  if (Ty0->getScalarSizeInBits() > Ty1->getScalarSizeInBits())
+    return Ty0;
+  return Ty1;
 }
 
 /// Top-level call to convert loop to spawn its iterations in a
@@ -994,8 +928,19 @@ bool DACLoopSpawning::processLoop() {
   // ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "LoopLimit", L->getStartLoc(),
   //                                     Header)
   //          << "loop limit: " << NV("Limit", Limit));
+  /// Determine the type of the canonical IV.
+  Type *CanonicalIVTy = Limit->getType();
+  {
+    const DataLayout &DL = M->getDataLayout();
+    for (BasicBlock::iterator II = Header->begin(); isa<PHINode>(II); ++II) {
+      PHINode *PN = cast<PHINode>(II);
+      if (PN->getType()->isFloatingPointTy()) continue;
+      CanonicalIVTy = getWiderType(DL, PN->getType(), CanonicalIVTy);
+    }
+    Limit = SE.getNoopOrAnyExtend(Limit, CanonicalIVTy);
+  }
   /// Clean up the loop's induction variables.
-  PHINode *CanonicalIV = canonicalizeIVs(Limit->getType());
+  PHINode *CanonicalIV = canonicalizeIVs(CanonicalIVTy);
   if (!CanonicalIV) {
     DEBUG(dbgs() << "Could not get canonical IV.\n");
     // emitAnalysis(LoopSpawningReport()
@@ -1111,7 +1056,7 @@ bool DACLoopSpawning::processLoop() {
     return false;
 
   // Insert the computation for the loop limit into the Preheader.
-  Value *LimitVar = Exp.expandCodeFor(Limit, Limit->getType(),
+  Value *LimitVar = Exp.expandCodeFor(Limit, CanonicalIVTy,
                                       Preheader->getTerminator());
   DEBUG(dbgs() << "LimitVar: " << *LimitVar << "\n");
 
@@ -1145,6 +1090,7 @@ bool DACLoopSpawning::processLoop() {
   ValueToValueMapTy VMap, InputMap;
   std::vector<BasicBlock *> LoopBlocks;
   SmallPtrSet<BasicBlock *, 4> ExitsToSplit;
+  Value *SRetInput = nullptr;
 
   // Get the sync region containing this Tapir loop.
   const Instruction *InputSyncRegion;
@@ -1206,6 +1152,23 @@ bool DACLoopSpawning::processLoop() {
       for (BasicBlock *BB : LoopBlocks)
         Blocks.insert(BB);
       findInputsOutputs(Blocks, BodyInputs, BodyOutputs, &ExitsToSplit);
+    }
+
+    // Scan for any sret parameters in BodyInputs and add them first.
+    if (F->hasStructRetAttr()) {
+      Function::arg_iterator ArgIter = F->arg_begin();
+      if (F->hasParamAttribute(0, Attribute::StructRet))
+	if (BodyInputs.count(&*ArgIter))
+	  SRetInput = &*ArgIter;
+      if (F->hasParamAttribute(1, Attribute::StructRet)) {
+	++ArgIter;
+	if (BodyInputs.count(&*ArgIter))
+	  SRetInput = &*ArgIter;
+      }
+    }
+    if (SRetInput) {
+      DEBUG(dbgs() << "sret input " << *SRetInput << "\n");
+      Inputs.insert(SRetInput);
     }
 
     // Add argument for start of CanonicalIV.
@@ -1483,6 +1446,9 @@ bool DACLoopSpawning::processLoop() {
   {
     // Setup arguments for call.
     SmallVector<Value *, 4> TopCallArgs;
+    // Add sret input, if it exists.
+    if (SRetInput)
+      TopCallArgs.push_back(SRetInput);
     // Add start iteration 0.
     assert(CanonicalSCEV->getStart()->isZero() &&
            "Canonical IV does not start at zero.");
@@ -1558,85 +1524,94 @@ bool DACLoopSpawning::processLoop() {
   return Helper;
 }
 
-/// \brief Replace the latch of the loop to check that IV is always less than or
-/// equal to the limit.
-///
-/// This method assumes that the loop has a single loop latch.
-Value* CilkABILoopSpawning::canonicalizeLoopLatch(PHINode *IV, Value *Limit) {
-  Loop *L = OrigLoop;
+/// This routine recursively examines all descendants of the specified loop and
+/// adds all Tapir loops in that tree to the vector.  This routine performs a
+/// pre-order traversal of the tree of loops and pushes each Tapir loop found
+/// onto the end of the vector.
+void LoopSpawningImpl::addTapirLoop(Loop *L, SmallVectorImpl<Loop *> &V) {
+  if (isCanonicalTapirLoop(L)) {
+    V.push_back(L);
+    return;
+  }
 
-  Value *NewCondition;
-  BasicBlock *Header = L->getHeader();
-  BasicBlock *Latch = L->getLoopLatch();
-  assert(Latch && "No single loop latch found for loop.");
+  LoopSpawningHints Hints(L);
 
-  IRBuilder<> Builder(&*Latch->getFirstInsertionPt());
-
-  // This process assumes that IV's increment is in Latch.
-
-  // Create comparison between IV and Limit at top of Latch.
-  NewCondition =
-    Builder.CreateICmpULT(Builder.CreateAdd(IV,
-                                            ConstantInt::get(IV->getType(), 1)),
-                          Limit);
-
-  // Replace the conditional branch at the end of Latch.
-  BranchInst *LatchBr = dyn_cast_or_null<BranchInst>(Latch->getTerminator());
-  assert(LatchBr && LatchBr->isConditional() &&
-         "Latch does not terminate with a conditional branch.");
-  Builder.SetInsertPoint(Latch->getTerminator());
-  Builder.CreateCondBr(NewCondition, Header, ExitBlock);
-
-  // Erase the old conditional branch.
-  LatchBr->eraseFromParent();
-
-  return NewCondition;
-}
-
-/// Top-level call to convert a Tapir loop to be processed using an appropriate
-/// Cilk ABI call.
-bool CilkABILoopSpawning::processLoop() {
-  Loop *L = OrigLoop;
-
-  BasicBlock *Header = L->getHeader();
-  BasicBlock *Preheader = L->getLoopPreheader();
-  BasicBlock *Latch = L->getLoopLatch();
+  DEBUG(dbgs() << "LS: Loop hints:"
+               << " strategy = " << Hints.printStrategy(Hints.getStrategy())
+               << " grainsize = " << Hints.getGrainsize()
+               << "\n");
 
   using namespace ore;
 
-  // Check the exit blocks of the loop.
-  if (!ExitBlock) {
-    DEBUG(dbgs() << "LS loop does not contain valid exit block after latch.\n");
-    ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "InvalidLatchExit",
-                                        L->getStartLoc(),
-                                        Header)
-             << "invalid latch exit");
-    return false;
+  if (LoopSpawningHints::ST_SEQ != Hints.getStrategy()) {
+    DEBUG(dbgs() << "LS: Marked loop is not a valid Tapir loop.\n"
+          << "\tLoop hints:"
+          << " strategy = " << Hints.printStrategy(Hints.getStrategy())
+          << "\n");
+    ORE.emit(OptimizationRemarkMissed(LS_NAME, "NotTapir",
+                                      L->getStartLoc(), L->getHeader())
+             << "marked loop is not a valid Tapir loop");
   }
 
-  SmallVector<BasicBlock *, 4> ExitBlocks;
-  L->getExitBlocks(ExitBlocks);
-  for (const BasicBlock *Exit : ExitBlocks) {
-    if (Exit == ExitBlock) continue;
-    if (!isa<UnreachableInst>(Exit->getTerminator())) {
-      DEBUG(dbgs() << "LS loop contains a bad exit block " << *Exit);
-      ORE.emit(OptimizationRemarkAnalysis(LS_NAME, "BadExit",
-                                          L->getStartLoc(),
-                                          Header)
-               << "bad exit block found");
-      return false;
-    }
+  for (Loop *InnerL : *L)
+    addTapirLoop(InnerL, V);
+}
+
+#ifndef NDEBUG
+/// \return string containing a file name and a line # for the given loop.
+static std::string getDebugLocString(const Loop *L) {
+  std::string Result;
+  if (L) {
+    raw_string_ostream OS(Result);
+    if (const DebugLoc LoopDbgLoc = L->getStartLoc())
+      LoopDbgLoc.print(OS);
+    else
+      // Just print the module name.
+      OS << L->getHeader()->getParent()->getParent()->getModuleIdentifier();
+    OS.flush();
   }
+  return Result;
+}
+#endif
 
-  Function *F = Header->getParent();
-  Module* M = F->getParent();
+bool LoopSpawningImpl::run() {
+  // Build up a worklist of inner-loops to vectorize. This is necessary as
+  // the act of vectorizing or partially unrolling a loop creates new loops
+  // and can invalidate iterators across the loops.
+  SmallVector<Loop *, 8> Worklist;
 
-  DEBUG(dbgs() << "LS loop header:" << *Header);
-  DEBUG(dbgs() << "LS loop latch:" << *Latch);
+  // Examine all top-level loops in this function, and call addTapirLoop to push
+  // those loops onto the work list.
+  for (Loop *L : LI)
+    addTapirLoop(L, Worklist);
 
-  // DEBUG(dbgs() << "LS SE backedge taken count: " << *(SE.getBackedgeTakenCount(L)) << "\n");
-  // DEBUG(dbgs() << "LS SE max backedge taken count: " << *(SE.getMaxBackedgeTakenCount(L)) << "\n");
-  DEBUG(dbgs() << "LS SE exit count: " << *(SE.getExitCount(L, Latch)) << "\n");
+  LoopsAnalyzed += Worklist.size();
+
+  // Now walk the identified inner loops.
+  bool Changed = false;
+  while (!Worklist.empty())
+    // Process the work list of loops backwards.  For each tree of loops in this
+    // function, addTapirLoop pushed those loops onto the work list according to
+    // a pre-order tree traversal.  Therefore, processing the work list
+    // backwards leads us to process innermost loops first.
+    Changed |= processLoop(Worklist.pop_back_val());
+
+  // Process each loop nest in the function.
+  return Changed;
+}
+
+// Top-level routine to process a given loop.
+bool LoopSpawningImpl::processLoop(Loop *L) {
+#ifndef NDEBUG
+  const std::string DebugLocStr = getDebugLocString(L);
+#endif /* NDEBUG */
+
+  // Function containing loop
+  Function *F = L->getHeader()->getParent();
+
+  DEBUG(dbgs() << "\nLS: Checking a Tapir loop in \""
+               << L->getHeader()->getParent()->getName() << "\" from "
+        << DebugLocStr << ": " << *L << "\n");
 
   /// Get loop limit.
   const SCEV *BETC = SE.getExitCount(L, Latch);
@@ -2506,13 +2481,13 @@ struct LoopSpawning : public FunctionPass {
   /// Pass identification, replacement for typeid
   static char ID;
   TapirTarget* tapirTarget;
-  explicit LoopSpawning(TapirTarget* tapirTarget = nullptr) : FunctionPass(ID),
-    tapirTarget(tapirTarget) {
-      if (!this->tapirTarget && cilkTarget) {
-        this->tapirTarget = new tapir::CilkABI();
-      }
-      assert(this->tapirTarget);
-      initializeLoopSpawningPass(*PassRegistry::getPassRegistry());
+  explicit LoopSpawning(TapirTarget* tapirTarget = nullptr)
+      : FunctionPass(ID), tapirTarget(tapirTarget) {
+    if (!this->tapirTarget)
+      this->tapirTarget = getTapirTargetFromType(ClTapirTarget);
+
+    assert(this->tapirTarget);
+    initializeLoopSpawningPass(*PassRegistry::getPassRegistry());
   }
 
   bool runOnFunction(Function &F) override {
